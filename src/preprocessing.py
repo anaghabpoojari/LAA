@@ -1,289 +1,242 @@
 """
-Preprocessing module for gene expression data.
-
-This module provides functions for quality control, normalization,
-and standardization of high-dimensional gene expression matrices.
+preprocessing.py
+Reusable preprocessing functions for gene expression data.
 """
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 from sklearn.preprocessing import StandardScaler, RobustScaler
-from typing import Tuple, Dict, Optional
+import warnings
+warnings.filterwarnings('ignore')
 
 
-def load_expression_data(filepath: str, clinical_path: Optional[str] = None) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+# ─────────────────────────────────────────────
+# 1. DATA LOADING
+# ─────────────────────────────────────────────
+
+def load_geo_matrix(filepath: str) -> pd.DataFrame:
+    """Load a GEO series matrix file into a DataFrame (genes × samples)."""
+    df = pd.read_csv(filepath, sep='\t', comment='!', index_col=0)
+    df = df.dropna(how='all')
+    print(f"Loaded matrix: {df.shape[0]} probes × {df.shape[1]} samples")
+    return df
+
+
+def load_expression_csv(filepath: str, index_col: int = 0) -> pd.DataFrame:
+    """Load a generic CSV expression matrix."""
+    df = pd.read_csv(filepath, index_col=index_col)
+    print(f"Loaded expression matrix: {df.shape[0]} genes × {df.shape[1]} samples")
+    return df
+
+
+def load_metadata(filepath: str, sample_col: str = None) -> pd.DataFrame:
+    """Load sample metadata / phenotype table."""
+    meta = pd.read_csv(filepath, index_col=sample_col)
+    print(f"Metadata loaded: {meta.shape[0]} samples × {meta.shape[1]} columns")
+    return meta
+
+
+# ─────────────────────────────────────────────
+# 2. QUALITY CONTROL
+# ─────────────────────────────────────────────
+
+def qc_report(expr: pd.DataFrame) -> dict:
     """
-    Load gene expression data and optional clinical metadata.
-
-    Args:
-        filepath: Path to expression matrix CSV (genes as rows, samples as columns)
-        clinical_path: Optional path to clinical metadata CSV
-
-    Returns:
-        Tuple of (expression_df, clinical_df or None)
+    Basic QC metrics for an expression matrix.
+    Returns a dict with key stats and prints a summary.
     """
-    expr_df = pd.read_csv(filepath, index_col=0)
+    n_genes, n_samples = expr.shape
+    missing_pct = expr.isnull().values.mean() * 100
+    zero_pct    = (expr == 0).values.mean() * 100
+    per_gene_var = expr.var(axis=1)
+    low_var_genes = (per_gene_var < per_gene_var.quantile(0.10)).sum()
 
-    clinical_df = None
-    if clinical_path:
-        clinical_df = pd.read_csv(clinical_path, index_col=0)
-
-    return expr_df, clinical_df
-
-
-def quality_control_report(expr_df: pd.DataFrame) -> Dict:
-    """
-    Generate comprehensive QC report for expression data.
-
-    Args:
-        expr_df: Raw expression DataFrame
-
-    Returns:
-        Dictionary with QC statistics
-    """
-    n_genes, n_samples = expr_df.shape
-
-    # Zero statistics
-    zeros_per_gene = (expr_df == 0).sum(axis=1)
-    zeros_per_sample = (expr_df == 0).sum(axis=0)
-
-    # Missing values
-    missing_per_gene = expr_df.isna().sum()
-    missing_per_sample = expr_df.isna().sum(axis=0)
-
-    # Expression statistics
-    mean_expr = expr_df.mean(axis=1)
-    std_expr = expr_df.std(axis=1)
-    median_expr = expr_df.median(axis=1)
-
-    return {
-        'n_genes': n_genes,
-        'n_samples': n_samples,
-        'total_zeros': (expr_df == 0).sum().sum(),
-        'zero_fraction_per_gene': zeros_per_gene / n_samples,
-        'zero_fraction_per_sample': zeros_per_sample / n_genes,
-        'missing_per_gene': missing_per_gene,
-        'missing_per_sample': missing_per_sample,
-        'mean_expression': mean_expr,
-        'std_expression': std_expr,
-        'median_expression': median_expr,
-        'genes_with_any_zero': (zeros_per_gene > 0).sum(),
-        'genes_all_zero': (zeros_per_gene == n_samples).sum(),
-        'samples_with_any_zero': (zeros_per_sample > 0).sum(),
+    report = {
+        'n_genes':       n_genes,
+        'n_samples':     n_samples,
+        'missing_pct':   round(missing_pct, 3),
+        'zero_pct':      round(zero_pct, 3),
+        'low_var_genes': low_var_genes,
+        'mean_expr':     round(expr.values.mean(), 4),
+        'median_expr':   round(np.nanmedian(expr.values), 4),
     }
 
+    print("=" * 45)
+    print("  QC REPORT")
+    print("=" * 45)
+    for k, v in report.items():
+        print(f"  {k:<20}: {v}")
+    print("=" * 45)
+    return report
 
-def filter_genes_by_expression(
-    expr_df: pd.DataFrame,
-    max_zero_fraction: float = 0.8,
-    min_variance_percentile: float = 50,
-    remove_missing: bool = True
-) -> pd.DataFrame:
+
+def filter_low_expression(expr: pd.DataFrame,
+                           min_mean: float = 1.0,
+                           min_expressed_frac: float = 0.2) -> pd.DataFrame:
     """
-    Filter genes based on expression quality and variability.
-
-    Args:
-        expr_df: Raw expression DataFrame
-        max_zero_fraction: Maximum allowed fraction of zeros per gene
-        min_variance_percentile: Keep genes above this variance percentile
-        remove_missing: Whether to remove genes with any missing values
-
-    Returns:
-        Filtered expression DataFrame
+    Remove genes whose mean expression < min_mean OR that are expressed
+    in fewer than min_expressed_frac of samples.
     """
-    df = expr_df.copy()
-
-    # Remove genes with all zeros
-    non_zero_mask = (df != 0).any(axis=1)
-    df = df.loc[non_zero_mask]
-    print(f"After removing all-zero genes: {df.shape[0]} genes remaining")
-
-    # Remove genes with excessive zeros
-    zero_fraction = (df == 0).sum(axis=1) / df.shape[1]
-    zero_mask = zero_fraction < max_zero_fraction
-    df = df.loc[zero_mask]
-    print(f"After zero fraction filter (<{max_zero_fraction}): {df.shape[0]} genes remaining")
-
-    # Remove genes with missing values
-    if remove_missing:
-        missing_mask = ~df.isna().any(axis=1)
-        df = df.loc[missing_mask]
-        print(f"After removing missing values: {df.shape[0]} genes remaining")
-
-    # Variance-based filtering (applied after log transform typically)
-    if min_variance_percentile > 0:
-        gene_variance = df.var(axis=1)
-        variance_threshold = np.percentile(gene_variance, min_variance_percentile)
-        variance_mask = gene_variance > variance_threshold
-        df = df.loc[variance_mask]
-        print(f"After variance filter (>{min_variance_percentile}th percentile): {df.shape[0]} genes remaining")
-
-    return df
+    mean_filter = expr.mean(axis=1) >= min_mean
+    frac_filter = (expr > 0).mean(axis=1) >= min_expressed_frac
+    keep = mean_filter & frac_filter
+    filtered = expr.loc[keep]
+    print(f"Low-expression filter: {expr.shape[0]} → {filtered.shape[0]} genes retained")
+    return filtered
 
 
-def log_transform(expr_df: pd.DataFrame, pseudocount: float = 1.0) -> pd.DataFrame:
+def filter_low_variance(expr: pd.DataFrame, variance_quantile: float = 0.10) -> pd.DataFrame:
+    """Remove genes below the variance_quantile threshold."""
+    var = expr.var(axis=1)
+    threshold = var.quantile(variance_quantile)
+    keep = var >= threshold
+    filtered = expr.loc[keep]
+    print(f"Low-variance filter (q={variance_quantile}): "
+          f"{expr.shape[0]} → {filtered.shape[0]} genes retained")
+    return filtered
+
+
+def remove_duplicate_genes(expr: pd.DataFrame, keep: str = 'highest_mean') -> pd.DataFrame:
+    """Collapse duplicate gene symbols by keeping the row with the highest mean."""
+    if not expr.index.duplicated().any():
+        return expr
+    if keep == 'highest_mean':
+        expr = expr.loc[~expr.index.duplicated(keep='first')]   # fallback
+        expr['_mean'] = expr.mean(axis=1)
+        expr = expr.sort_values('_mean', ascending=False)
+        expr = expr[~expr.index.duplicated(keep='first')]
+        expr = expr.drop(columns='_mean')
+    print(f"After deduplication: {expr.shape[0]} unique genes")
+    return expr
+
+
+def detect_outlier_samples(expr: pd.DataFrame, z_threshold: float = 3.0) -> list:
     """
-    Apply log2 transformation to expression data.
-
-    Args:
-        expr_df: Expression DataFrame (non-negative values)
-        pseudocount: Value to add before log transform
-
-    Returns:
-        Log-transformed DataFrame
+    Detect outlier samples using correlation distance to the median profile.
+    Returns a list of outlier sample names.
     """
-    return np.log2(expr_df + pseudocount)
+    median_profile = expr.median(axis=1)
+    correlations   = expr.apply(lambda col: col.corr(median_profile), axis=0)
+    z_scores       = np.abs(stats.zscore(correlations))
+    outliers       = correlations.index[z_scores > z_threshold].tolist()
+    print(f"Outlier samples detected (|z|>{z_threshold}): {outliers}")
+    return outliers
 
 
-def normalize_samples(
-    expr_df: pd.DataFrame,
-    method: str = 'zscore',
-    axis: str = 'genes'
-) -> pd.DataFrame:
+# ─────────────────────────────────────────────
+# 3. NORMALISATION
+# ─────────────────────────────────────────────
+
+def log2_transform(expr: pd.DataFrame, pseudocount: float = 1.0) -> pd.DataFrame:
+    """log2(x + pseudocount) transformation."""
+    transformed = np.log2(expr + pseudocount)
+    print(f"log2 transform applied (pseudocount={pseudocount})")
+    return transformed
+
+
+def quantile_normalize(expr: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize expression data using specified method.
-
-    Args:
-        expr_df: Expression DataFrame
-        method: Normalization method ('zscore', 'robust', 'minmax')
-        axis: Whether to normalize genes (rows) or samples (columns)
-
-    Returns:
-        Normalized DataFrame
+    Quantile normalisation across samples (columns).
+    After normalisation every sample has the same distribution.
     """
-    if axis == 'genes':
-        normalize_axis = 0
-    elif axis == 'samples':
-        normalize_axis = 1
-    else:
-        raise ValueError("axis must be 'genes' or 'samples'")
+    rank_mean = expr.stack().groupby(expr.rank(method='first').stack().astype(int)).mean()
+    normalized = expr.rank(method='min').stack().astype(int).map(rank_mean).unstack()
+    print("Quantile normalisation applied")
+    return normalized
 
-    if method == 'zscore':
+
+def zscore_normalize(expr: pd.DataFrame, axis: int = 0) -> pd.DataFrame:
+    """
+    Z-score normalise.
+    axis=0 → per-gene (across samples)
+    axis=1 → per-sample (across genes)
+    """
+    if axis == 0:
         scaler = StandardScaler()
-    elif method == 'robust':
-        scaler = RobustScaler()
+        normed = pd.DataFrame(scaler.fit_transform(expr.T).T,
+                              index=expr.index, columns=expr.columns)
     else:
-        raise ValueError(f"Unknown method: {method}")
-
-    # sklearn works on samples as rows, so transpose if needed
-    if axis == 'genes':
-        normalized = scaler.fit_transform(expr_df.T).T
-    else:
-        normalized = scaler.fit_transform(expr_df)
-
-    return pd.DataFrame(
-        normalized,
-        index=expr_df.index,
-        columns=expr_df.columns
-    )
+        normed = expr.apply(stats.zscore, axis=1, result_type='broadcast')
+    print(f"Z-score normalisation applied (axis={axis})")
+    return normed
 
 
-def preprocess_expression(
-    expr_df: pd.DataFrame,
-    max_zero_fraction: float = 0.8,
-    min_variance_percentile: float = 50,
-    log_transform_flag: bool = True,
-    normalization_method: str = 'zscore'
-) -> Tuple[pd.DataFrame, Dict]:
+def tpm_normalize(counts: pd.DataFrame, gene_lengths: pd.Series) -> pd.DataFrame:
     """
-    Complete preprocessing pipeline for gene expression data.
-
-    Args:
-        expr_df: Raw expression DataFrame
-        max_zero_fraction: Max zeros allowed per gene
-        min_variance_percentile: Min variance percentile to keep gene
-        log_transform_flag: Whether to apply log2 transform
-        normalization_method: Method for final normalization
-
-    Returns:
-        Tuple of (preprocessed DataFrame, QC statistics dict)
+    TPM normalisation for RNA-seq raw counts.
+    gene_lengths : Series indexed by gene, lengths in base pairs.
     """
-    # Step 1: QC report on raw data
-    qc_stats = quality_control_report(expr_df)
-    qc_stats['raw_shape'] = expr_df.shape
+    common = counts.index.intersection(gene_lengths.index)
+    counts = counts.loc[common]
+    lengths = gene_lengths.loc[common]
 
-    # Step 2: Filter genes
-    expr_filtered = filter_genes_by_expression(
-        expr_df,
-        max_zero_fraction=max_zero_fraction,
-        min_variance_percentile=0,  # Variance filter after log transform
-        remove_missing=True
-    )
-
-    # Step 3: Log transform
-    if log_transform_flag:
-        expr_log = log_transform(expr_filtered)
-        qc_stats['log_transformed'] = True
-    else:
-        expr_log = expr_filtered
-        qc_stats['log_transformed'] = False
-
-    # Step 4: Variance filter (on log-transformed data)
-    if min_variance_percentile > 0:
-        gene_variance = expr_log.var(axis=1)
-        variance_threshold = np.percentile(gene_variance, min_variance_percentile)
-        variance_mask = gene_variance > variance_threshold
-        expr_log = expr_log.loc[variance_mask]
-        qc_stats['variance_filtered'] = expr_log.shape[0]
-
-    # Step 5: Normalize
-    expr_normalized = normalize_samples(expr_log, method=normalization_method)
-
-    # Final QC
-    qc_stats['final_shape'] = expr_normalized.shape
-    qc_stats['genes_removed'] = qc_stats['raw_shape'][0] - qc_stats['final_shape'][0]
-    qc_stats['samples_removed'] = qc_stats['raw_shape'][1] - qc_stats['final_shape'][1]
-
-    return expr_normalized, qc_stats
+    rpk   = counts.div(lengths / 1e3, axis=0)
+    scale = rpk.sum(axis=0) / 1e6
+    tpm   = rpk.div(scale, axis=1)
+    print(f"TPM normalisation applied to {tpm.shape[0]} genes")
+    return tpm
 
 
-def batch_correction_comBat(
-    expr_df: pd.DataFrame,
-    batch_labels: pd.Series
-) -> pd.DataFrame:
+def robust_scale(expr: pd.DataFrame) -> pd.DataFrame:
+    """RobustScaler (median / IQR) — less sensitive to outliers than z-score."""
+    scaler = RobustScaler()
+    scaled = pd.DataFrame(scaler.fit_transform(expr.T).T,
+                          index=expr.index, columns=expr.columns)
+    print("Robust scaling applied")
+    return scaled
+
+
+# ─────────────────────────────────────────────
+# 4. BATCH CORRECTION (simple mean-centring)
+# ─────────────────────────────────────────────
+
+def mean_center_batches(expr: pd.DataFrame, batch_labels: pd.Series) -> pd.DataFrame:
     """
-    Apply ComBat batch correction (simplified implementation).
-
-    For production use, consider the pycombat or sva packages.
-
-    Args:
-        expr_df: Normalized expression DataFrame
-        batch_labels: Series indicating batch for each sample
-
-    Returns:
-        Batch-corrected DataFrame
+    Simple batch correction: subtract each batch's mean expression per gene.
+    batch_labels : Series indexed by sample name.
     """
-    # Simple mean-centering per batch (simplified ComBat)
-    df = expr_df.copy()
-    batches = batch_labels.unique()
-
-    # Calculate global mean
-    global_mean = df.mean(axis=1)
-
-    # Center each batch
-    for batch in batches:
-        batch_mask = batch_labels == batch
-        batch_mean = df.loc[:, batch_mask].mean(axis=1)
-        # Adjust batch to have same mean as global
-        df.loc[:, batch_mask] = df.loc[:, batch_mask] - batch_mean.values[:, np.newaxis] + global_mean.values[:, np.newaxis]
-
-    return df
+    corrected = expr.copy()
+    for batch in batch_labels.unique():
+        samples = batch_labels[batch_labels == batch].index
+        batch_mean = expr[samples].mean(axis=1)
+        corrected[samples] = expr[samples].sub(batch_mean, axis=0)
+    print(f"Mean-centred {batch_labels.nunique()} batches")
+    return corrected
 
 
-def select_most_variable_genes(
-    expr_df: pd.DataFrame,
-    n_genes: int = 5000
-) -> pd.DataFrame:
+# ─────────────────────────────────────────────
+# 5. CONVENIENCE PIPELINE
+# ─────────────────────────────────────────────
+
+def full_preprocessing_pipeline(expr: pd.DataFrame,
+                                  log_transform: bool = True,
+                                  remove_low_expr: bool = True,
+                                  remove_low_var: bool = True,
+                                  normalise: str = 'zscore') -> pd.DataFrame:
     """
-    Select the most variable genes for downstream analysis.
+    One-shot preprocessing:
+      1. (Optional) log2 transform
+      2. (Optional) filter low-expression genes
+      3. (Optional) filter low-variance genes
+      4. Normalise (zscore | quantile | robust)
 
-    Args:
-        expr_df: Normalized expression DataFrame
-        n_genes: Number of genes to select
-
-    Returns:
-        DataFrame with selected genes only
+    Returns processed DataFrame.
     """
-    gene_variance = expr_df.var(axis=1)
-    top_genes = gene_variance.nlargest(n_genes).index
-    return expr_df.loc[top_genes]
+    print("\n── Full Preprocessing Pipeline ──")
+    if log_transform:
+        expr = log2_transform(expr)
+    if remove_low_expr:
+        expr = filter_low_expression(expr)
+    if remove_low_var:
+        expr = filter_low_variance(expr)
+
+    if normalise == 'zscore':
+        expr = zscore_normalize(expr)
+    elif normalise == 'quantile':
+        expr = quantile_normalize(expr)
+    elif normalise == 'robust':
+        expr = robust_scale(expr)
+
+    print(f"Final matrix: {expr.shape[0]} genes × {expr.shape[1]} samples\n")
+    return expr

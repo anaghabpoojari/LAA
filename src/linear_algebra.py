@@ -1,399 +1,316 @@
 """
-Linear Algebra utilities for gene expression analysis.
-
-This module provides core LA decomposition methods:
-- Singular Value Decomposition (SVD)
-- Principal Component Analysis (PCA)
-- Non-negative Matrix Factorization (NMF)
-- Eigenvalue analysis of correlation matrices
+linear_algebra.py
+Linear-algebra utility functions for gene expression analysis.
+Covers: SVD, PCA, NMF, ICA, CCA, eigenvalue decomposition,
+        gene loading extraction, and dimensionality-reduction helpers.
 """
 
 import numpy as np
 import pandas as pd
 from scipy import linalg
-from scipy.stats import pointbiserialr
-from sklearn.decomposition import PCA, NMF
-from sklearn.cluster import KMeans
-from typing import Dict, List, Tuple, Optional
-from statsmodels.stats import multitest
+from scipy.stats import pearsonr, spearmanr
+from sklearn.decomposition import PCA, NMF, FastICA, TruncatedSVD
+from sklearn.preprocessing import StandardScaler
+from sklearn.cross_decomposition import CCA
+import warnings
+warnings.filterwarnings('ignore')
 
 
-def svd_decomposition(
-    expr_matrix: np.ndarray,
-    full_matrices: bool = False
-) -> Dict:
+# ─────────────────────────────────────────────
+# 1. SVD  (full & truncated)
+# ─────────────────────────────────────────────
+
+def run_svd(expr: pd.DataFrame, n_components: int = 50) -> dict:
     """
-    Perform Singular Value Decomposition on expression matrix.
-
-    X = U @ diag(s) @ Vt
-
-    Args:
-        expr_matrix: Centered expression matrix (genes × samples)
-        full_matrices: Whether to return full or economy SVD
-
-    Returns:
-        Dictionary with U, s, Vt, and derived statistics
+    Truncated SVD on the expression matrix (genes × samples).
+    Returns U (gene space), S (singular values), Vt (sample space).
     """
-    # Economy SVD for tall matrices (more genes than samples)
-    U, s, Vt = linalg.svd(expr_matrix, full_matrices=full_matrices)
+    X = expr.values.astype(float)
+    svd = TruncatedSVD(n_components=n_components, random_state=42)
+    svd.fit(X)
 
-    n_samples = expr_matrix.shape[1]
+    U  = svd.components_.T                        # genes  × k
+    S  = svd.singular_values_                      # k
+    Vt = svd.transform(X) / S                     # samples × k  (right singular vectors)
 
-    # Explained variance from singular values
-    explained_variance = (s ** 2) / (n_samples - 1)
-    variance_ratio = explained_variance / explained_variance.sum()
-    cumulative_variance = np.cumsum(variance_ratio)
+    explained = svd.explained_variance_ratio_
 
-    # Optimal k for different variance thresholds
-    k_90 = np.searchsorted(cumulative_variance, 0.90) + 1
-    k_95 = np.searchsorted(cumulative_variance, 0.95) + 1
-    k_99 = np.searchsorted(cumulative_variance, 0.99) + 1
+    print(f"SVD: top-{n_components} components explain "
+          f"{explained.sum()*100:.1f}% variance")
 
     return {
-        'U': U,  # Left singular vectors (genes × components)
-        's': s,  # Singular values
-        'Vt': Vt,  # Right singular vectors (components × samples)
-        'explained_variance': explained_variance,
-        'variance_ratio': variance_ratio,
-        'cumulative_variance': cumulative_variance,
-        'k_90': int(k_90),
-        'k_95': int(k_95),
-        'k_99': int(k_99),
-        'n_components': len(s)
+        'U':        U,          # gene   loadings
+        'S':        S,          # singular values
+        'Vt':       Vt,         # sample scores
+        'explained_variance_ratio': explained,
+        'gene_names':   expr.index.tolist(),
+        'sample_names': expr.columns.tolist(),
     }
 
 
-def pca_analysis(
-    expr_matrix: np.ndarray,
-    n_components: int = 50,
-    svd_solver: str = 'full'
-) -> Dict:
+def svd_explained_variance_table(svd_result: dict) -> pd.DataFrame:
+    """Return a DataFrame of cumulative explained variance per component."""
+    evr = svd_result['explained_variance_ratio']
+    df  = pd.DataFrame({
+        'component':          np.arange(1, len(evr)+1),
+        'explained_variance': evr,
+        'cumulative':         np.cumsum(evr),
+    })
+    return df
+
+
+def select_n_components_by_variance(svd_result: dict,
+                                     threshold: float = 0.90) -> int:
+    """Return the number of SVD components needed to explain ≥ threshold variance."""
+    cum = np.cumsum(svd_result['explained_variance_ratio'])
+    n   = int(np.searchsorted(cum, threshold)) + 1
+    print(f"Components to explain ≥{threshold*100:.0f}% variance: {n}")
+    return n
+
+
+# ─────────────────────────────────────────────
+# 2. PCA
+# ─────────────────────────────────────────────
+
+def run_pca(expr: pd.DataFrame, n_components: int = 50,
+            center: bool = True, scale: bool = False) -> dict:
     """
-    Perform Principal Component Analysis on expression matrix.
-
-    Args:
-        expr_matrix: Expression matrix (samples × genes) - sklearn convention
-        n_components: Number of PCs to compute
-        svd_solver: SVD solver to use
-
-    Returns:
-        Dictionary with PCA results and statistics
+    PCA on the expression matrix (genes × samples).
+    By default centres (not scales) the data before decomposition.
+    Returns sample scores, gene loadings, and explained variance.
     """
-    pca = PCA(n_components=n_components, svd_solver=svd_solver)
-    X_pca = pca.fit_transform(expr_matrix)
+    X = expr.T.values.astype(float)   # samples × genes
 
-    return {
-        'X_pca': X_pca,  # Transformed data (samples × components)
-        'components': pca.components_,  # Principal axes (components × genes)
-        'explained_variance': pca.explained_variance_,
+    if center or scale:
+        scaler = StandardScaler(with_mean=center, with_std=scale)
+        X = scaler.fit_transform(X)
+
+    pca   = PCA(n_components=n_components, random_state=42)
+    scores = pca.fit_transform(X)    # samples × k
+
+    result = {
+        'scores':    pd.DataFrame(scores,
+                                  index=expr.columns,
+                                  columns=[f'PC{i+1}' for i in range(n_components)]),
+        'loadings':  pd.DataFrame(pca.components_.T,
+                                  index=expr.index,
+                                  columns=[f'PC{i+1}' for i in range(n_components)]),
         'explained_variance_ratio': pca.explained_variance_ratio_,
-        'cumulative_variance_ratio': np.cumsum(pca.explained_variance_ratio_),
-        'singular_values': pca.singular_values_,
-        'mean': pca.mean_,
-        'n_components': pca.n_components_,
-        'model': pca
+        'explained_variance':       pca.explained_variance_,
+        'pca_object': pca,
     }
 
+    print(f"PCA: top-{n_components} PCs explain "
+          f"{pca.explained_variance_ratio_.sum()*100:.1f}% variance")
+    return result
 
-def nmf_decomposition(
-    expr_matrix: np.ndarray,
-    n_components: int = 10,
-    init: str = 'nndsvda',
-    max_iter: int = 500,
-    random_state: int = 42
-) -> Dict:
+
+def pca_gene_contributions(pca_result: dict, pc: int = 1, top_n: int = 20) -> pd.DataFrame:
+    """Return top_n genes contributing most to a given principal component (1-indexed)."""
+    col  = f'PC{pc}'
+    load = pca_result['loadings'][col].abs().sort_values(ascending=False)
+    return pca_result['loadings'].loc[load.index[:top_n], [col]]
+
+
+def project_new_samples(pca_result: dict, new_expr: pd.DataFrame) -> pd.DataFrame:
+    """Project new samples (genes × samples) into the PCA space."""
+    pca = pca_result['pca_object']
+    X   = new_expr.T.values.astype(float)
+    proj = pca.transform(X)
+    return pd.DataFrame(proj, index=new_expr.columns,
+                        columns=pca_result['scores'].columns)
+
+
+# ─────────────────────────────────────────────
+# 3. NMF  (metagenes)
+# ─────────────────────────────────────────────
+
+def run_nmf(expr: pd.DataFrame, n_components: int = 10,
+            max_iter: int = 500, init: str = 'nndsvda') -> dict:
     """
-    Perform Non-negative Matrix Factorization.
-
-    X ≈ W @ H  where W >= 0, H >= 0
-
-    Args:
-        expr_matrix: Non-negative expression matrix (samples × genes)
-        n_components: Number of metagenes (rank of factorization)
-        init: Initialization method ('random', 'nndsvd', 'nndsvda', 'nndsvdar')
-        max_iter: Maximum iterations
-        random_state: Random seed for reproducibility
-
-    Returns:
-        Dictionary with W, H, and model statistics
+    Non-negative matrix factorisation: X ≈ W · H
+      W  (genes × k)  — metagene signatures
+      H  (k × samples) — sample metagene usage
+    Requires non-negative input — shifts data if needed.
     """
-    nmf = NMF(
-        n_components=n_components,
-        init=init,
-        max_iter=max_iter,
-        random_state=random_state,
-        tol=1e-4,
-        alpha_W=0.0,
-        alpha_H=0.0
-    )
+    X = expr.values.astype(float)
+    if X.min() < 0:
+        X = X - X.min()          # shift to non-negative
 
-    W = nmf.fit_transform(expr_matrix)  # Samples × Metagenes
-    H = nmf.components_  # Metagenes × Genes
+    nmf = NMF(n_components=n_components, init=init,
+              max_iter=max_iter, random_state=42)
+    W   = nmf.fit_transform(X)   # genes × k
+    H   = nmf.components_        # k × samples
 
-    # Reconstruction error (Frobenius norm)
-    reconstruction_error = np.linalg.norm(expr_matrix - W @ H, 'fro')
-
-    # Relative error
-    relative_error = reconstruction_error / np.linalg.norm(expr_matrix, 'fro')
+    recon_error = nmf.reconstruction_err_
+    print(f"NMF ({n_components} components): reconstruction error = {recon_error:.4f}")
 
     return {
-        'W': W,  # Sample coefficients (samples × metagenes)
-        'H': H,  # Metagene basis (metagenes × genes)
-        'reconstruction_error': reconstruction_error,
-        'relative_error': relative_error,
-        'n_iter': nmf.n_iter_,
-        'model': nmf
+        'W': pd.DataFrame(W, index=expr.index,
+                          columns=[f'Metagene{i+1}' for i in range(n_components)]),
+        'H': pd.DataFrame(H,
+                          index=[f'Metagene{i+1}' for i in range(n_components)],
+                          columns=expr.columns),
+        'reconstruction_error': recon_error,
+        'nmf_object': nmf,
     }
 
 
-def nmf_rank_selection(
-    expr_matrix: np.ndarray,
-    n_components_range: List[int],
-    **nmf_kwargs
-) -> Dict:
+def top_metagene_genes(nmf_result: dict, metagene: int = 1,
+                        top_n: int = 30) -> pd.Series:
+    """Return top_n genes with highest weight for a given metagene (1-indexed)."""
+    col = f'Metagene{metagene}'
+    return nmf_result['W'][col].sort_values(ascending=False).head(top_n)
+
+
+# ─────────────────────────────────────────────
+# 4. ICA  (independent components)
+# ─────────────────────────────────────────────
+
+def run_ica(expr: pd.DataFrame, n_components: int = 20,
+            max_iter: int = 1000) -> dict:
     """
-    Run NMF across multiple rank values for component selection.
-
-    Args:
-        expr_matrix: Non-negative expression matrix
-        n_components_range: List of k values to try
-        **nmf_kwargs: Additional arguments for NMF
-
-    Returns:
-        Dictionary with results for each k
+    FastICA on the expression matrix.
+    Returns mixing matrix (genes × k) and sample activations (samples × k).
     """
-    results = []
+    X   = expr.T.values.astype(float)   # samples × genes
+    ica = FastICA(n_components=n_components, max_iter=max_iter, random_state=42)
+    S   = ica.fit_transform(X)          # samples × k  (source signals)
+    A   = ica.mixing_                   # genes × k   (mixing / loading matrix)
 
-    for k in n_components_range:
-        result = nmf_decomposition(expr_matrix, n_components=k, **nmf_kwargs)
-        results.append({
-            'k': k,
-            **result
-        })
-
+    print(f"ICA: {n_components} independent components extracted")
     return {
-        'results': results,
-        'errors': [r['reconstruction_error'] for r in results],
-        'relative_errors': [r['relative_error'] for r in results],
-        'k_values': n_components_range
+        'sources':  pd.DataFrame(S, index=expr.columns,
+                                 columns=[f'IC{i+1}' for i in range(n_components)]),
+        'mixing':   pd.DataFrame(A, index=expr.index,
+                                 columns=[f'IC{i+1}' for i in range(n_components)]),
+        'ica_object': ica,
     }
 
 
-def correlation_eigenvalue_analysis(
-    expr_matrix: np.ndarray,
-    method: str = 'pearson'
-) -> Dict:
-    """
-    Perform eigenvalue decomposition of gene-gene correlation matrix.
+# ─────────────────────────────────────────────
+# 5. CORRELATION & EIGENVALUE ANALYSIS
+# ─────────────────────────────────────────────
 
-    Args:
-        expr_matrix: Expression matrix (samples × genes)
-        method: Correlation method ('pearson', 'spearman')
-
-    Returns:
-        Dictionary with eigenvalue analysis results
-    """
-    # Compute correlation matrix (genes × genes)
-    corr_matrix = np.corrcoef(expr_matrix.T)
-
-    # Handle NaN values in correlation matrix
-    corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
-
-    # Eigenvalue decomposition (symmetric matrix)
-    eigenvalues, eigenvectors = np.linalg.eigh(corr_matrix)
-
-    # Sort by eigenvalue magnitude (descending)
-    idx = np.argsort(eigenvalues)[::-1]
-    eigenvalues = eigenvalues[idx]
-    eigenvectors = eigenvectors[:, idx]
-
-    # Marchenko-Pastur threshold for random matrix
-    n_genes, n_samples = expr_matrix.shape
-    Q = n_genes / n_samples
-    lambda_max = (1 + np.sqrt(1/Q)) ** 2
-    lambda_min = (1 - np.sqrt(1/Q)) ** 2
-
-    # Significant eigenvalues (outside MP distribution)
-    significant_mask = eigenvalues > lambda_max
-
-    # Explained variance
-    total_variance = eigenvalues.sum()
-    variance_ratio = eigenvalues / total_variance
-    cumulative_variance = np.cumsum(variance_ratio)
-
-    return {
-        'eigenvalues': eigenvalues,
-        'eigenvectors': eigenvectors,
-        'corr_matrix': corr_matrix,
-        'lambda_max': lambda_max,
-        'lambda_min': lambda_min,
-        'significant_eigenvalues': eigenvalues[significant_mask],
-        'n_significant': significant_mask.sum(),
-        'variance_ratio': variance_ratio,
-        'cumulative_variance': cumulative_variance,
-        'marchenko_pastur_threshold': lambda_max
-    }
-
-
-def identify_hub_genes(
-    corr_matrix: np.ndarray,
-    gene_names: List[str],
-    top_k: int = 100
-) -> pd.DataFrame:
-    """
-    Identify hub genes using eigenvector centrality.
-
-    Args:
-        corr_matrix: Gene-gene correlation matrix
-        gene_names: List of gene names
-        top_k: Number of top hub genes to return
-
-    Returns:
-        DataFrame with hub gene rankings
-    """
-    # Power iteration for dominant eigenvector (eigenvector centrality)
-    n_genes = corr_matrix.shape[0]
-    v = np.ones(n_genes) / n_genes
-
-    for _ in range(100):  # Power iterations
-        v_new = corr_matrix @ v
-        v_new = v_new / np.linalg.norm(v_new)
-        if np.linalg.norm(v_new - v) < 1e-10:
-            break
-        v = v_new
-
-    # Gene rankings by centrality
-    centrality_df = pd.DataFrame({
-        'gene': gene_names,
-        'eigenvector_centrality': v
-    })
-    centrality_df = centrality_df.sort_values('eigenvector_centrality', ascending=False)
-
-    return centrality_df.head(top_k)
-
-
-def correlate_components_with_disease(
-    component_scores: np.ndarray,
-    disease_labels: np.ndarray,
-    component_names: List[str],
-    alpha: float = 0.05
-) -> pd.DataFrame:
-    """
-    Correlate PCA/NMF components with disease labels.
-
-    Args:
-        component_scores: Sample scores on components (samples × components)
-        disease_labels: Disease labels for each sample
-        component_names: Names for each component
-        alpha: Significance threshold
-
-    Returns:
-        DataFrame with correlation statistics
-    """
-    # Encode disease labels if categorical
-    if not np.issubdtype(disease_labels.dtype, np.number):
-        from sklearn.preprocessing import LabelEncoder
-        le = LabelEncoder()
-        disease_encoded = le.fit_transform(disease_labels)
+def gene_correlation_matrix(expr: pd.DataFrame,
+                              method: str = 'pearson') -> pd.DataFrame:
+    """Compute gene–gene correlation matrix (genes × genes)."""
+    if method == 'pearson':
+        corr = expr.T.corr()
     else:
-        disease_encoded = disease_labels
-
-    correlations = []
-    pvalues = []
-
-    for i in range(component_scores.shape[1]):
-        corr, pval = pointbiserialr(component_scores[:, i], disease_encoded)
-        correlations.append(corr)
-        pvalues.append(pval)
-
-    # Multiple testing correction (FDR)
-    _, corrected_pvalues, _, _ = multitest.multipletests(
-        pvalues, alpha=alpha, method='fdr_bh'
-    )
-
-    results_df = pd.DataFrame({
-        'component': component_names,
-        'correlation': correlations,
-        'pvalue': pvalues,
-        'corrected_pvalue': corrected_pvalues,
-        'significant': corrected_pvalues < alpha
-    })
-
-    return results_df.sort_values('correlation', key=abs, ascending=False)
+        corr = expr.T.corr(method='spearman')
+    print(f"{method.capitalize()} correlation matrix: {corr.shape}")
+    return corr
 
 
-def low_rank_approximation(
-    expr_matrix: np.ndarray,
-    k: int,
-    method: str = 'svd'
-) -> Dict:
+def sample_correlation_matrix(expr: pd.DataFrame,
+                               method: str = 'pearson') -> pd.DataFrame:
+    """Compute sample–sample correlation matrix (samples × samples)."""
+    corr = expr.corr(method=method)
+    print(f"Sample {method} correlation matrix: {corr.shape}")
+    return corr
+
+
+def eigenvalue_decomposition(corr_matrix: pd.DataFrame) -> dict:
     """
-    Compute rank-k approximation of expression matrix.
-
-    Args:
-        expr_matrix: Original expression matrix
-        k: Target rank
-        method: Decomposition method ('svd' or 'pca')
-
-    Returns:
-        Dictionary with approximation results
+    Eigenvalue decomposition of a (symmetric) correlation matrix.
+    Returns eigenvalues (descending) and eigenvectors.
     """
-    if method == 'svd':
-        U, s, Vt = linalg.svd(expr_matrix, full_matrices=False)
-        X_approx = U[:, :k] @ np.diag(s[:k]) @ Vt[:k, :]
-    elif method == 'pca':
-        pca = PCA(n_components=k)
-        X_pca = pca.fit_transform(expr_matrix)
-        X_approx = pca.inverse_transform(X_pca)
-    else:
-        raise ValueError(f"Unknown method: {method}")
+    vals, vecs = linalg.eigh(corr_matrix.values)
+    idx   = np.argsort(vals)[::-1]
+    vals  = vals[idx]
+    vecs  = vecs[:, idx]
 
-    # Approximation error
-    error = np.linalg.norm(expr_matrix - X_approx, 'fro')
-    relative_error = error / np.linalg.norm(expr_matrix, 'fro')
-
-    # R-squared (variance explained)
-    ss_res = np.sum((expr_matrix - X_approx) ** 2)
-    ss_tot = np.sum((expr_matrix - expr_matrix.mean()) ** 2)
-    r_squared = 1 - (ss_res / ss_tot)
+    total  = vals.sum()
+    evr    = vals / total
 
     return {
-        'X_approx': X_approx,
-        'error': error,
-        'relative_error': relative_error,
-        'r_squared': r_squared,
-        'rank': k
+        'eigenvalues':              vals,
+        'eigenvectors':             vecs,
+        'explained_variance_ratio': evr,
+        'cumulative_variance':      np.cumsum(evr),
+        'labels':                   corr_matrix.index.tolist(),
     }
 
 
-def effective_dimensionality(
-    eigenvalues: np.ndarray,
-    method: str = 'participation'
-) -> float:
+def marchenko_pastur_threshold(n_genes: int, n_samples: int,
+                                sigma: float = 1.0) -> float:
     """
-    Estimate effective dimensionality of data.
-
-    Args:
-        eigenvalues: Eigenvalues from covariance/correlation matrix
-        method: Estimation method ('participation' or 'entropy')
-
-    Returns:
-        Effective dimensionality estimate
+    Marchenko–Pastur upper bound — the maximum eigenvalue expected under a
+    random (null) correlation model. Eigenvalues above this are 'signal'.
     """
-    # Normalize eigenvalues
-    eigenvalues = np.maximum(eigenvalues, 0)  # Ensure non-negative
-    total = eigenvalues.sum()
-    if total == 0:
-        return 0.0
+    ratio = n_genes / n_samples
+    lmax  = sigma**2 * (1 + np.sqrt(ratio))**2
+    print(f"Marchenko–Pastur threshold: λ_max = {lmax:.4f}")
+    return lmax
 
-    p = eigenvalues / total
 
-    if method == 'participation':
-        # Participation ratio (inverse Simpson index)
-        return 1.0 / np.sum(p ** 2)
-    elif method == 'entropy':
-        # Entropy-based dimensionality
-        p_nonzero = p[p > 0]
-        return np.exp(-np.sum(p_nonzero * np.log(p_nonzero)))
-    else:
-        raise ValueError(f"Unknown method: {method}")
+def significant_eigengenes(eig_result: dict, threshold: float) -> np.ndarray:
+    """Return indices of eigenvalues that exceed a given threshold."""
+    idx = np.where(eig_result['eigenvalues'] > threshold)[0]
+    print(f"Significant eigengenes (λ > {threshold:.3f}): {len(idx)}")
+    return idx
+
+
+# ─────────────────────────────────────────────
+# 6. GENE LOADING EXTRACTION
+# ─────────────────────────────────────────────
+
+def get_top_genes_by_loading(loadings: pd.DataFrame, component: str,
+                              top_n: int = 50, absolute: bool = True) -> pd.DataFrame:
+    """
+    Extract top_n genes by their loading magnitude on a given component.
+    loadings : DataFrame (genes × components)
+    component: column name, e.g. 'PC1', 'Metagene3'
+    """
+    col  = loadings[component]
+    col  = col.abs() if absolute else col
+    top  = col.sort_values(ascending=False).head(top_n)
+    return loadings.loc[top.index, [component]]
+
+
+def biplot_loadings(pca_result: dict, pc_x: int = 1, pc_y: int = 2,
+                    top_n: int = 15) -> pd.DataFrame:
+    """
+    Return gene loadings on two PCs for biplot visualisation.
+    Scaled to unit circle.
+    """
+    cx, cy = f'PC{pc_x}', f'PC{pc_y}'
+    load   = pca_result['loadings'][[cx, cy]].copy()
+    # scale so max loading = 1
+    for c in [cx, cy]:
+        load[c] = load[c] / load[c].abs().max()
+    # select genes with largest combined magnitude
+    load['mag'] = np.sqrt(load[cx]**2 + load[cy]**2)
+    return load.nlargest(top_n, 'mag').drop(columns='mag')
+
+
+# ─────────────────────────────────────────────
+# 7. MATRIX UTILITIES
+# ─────────────────────────────────────────────
+
+def condition_number(matrix: np.ndarray) -> float:
+    """Return the condition number κ = σ_max / σ_min."""
+    s  = np.linalg.svd(matrix, compute_uv=False)
+    kn = s.max() / (s.min() + 1e-12)
+    print(f"Condition number: {kn:.2f}")
+    return kn
+
+
+def effective_rank(singular_values: np.ndarray, threshold: float = 0.99) -> int:
+    """Number of singular values needed to capture ≥ threshold of total energy."""
+    energy = np.cumsum(singular_values**2) / (singular_values**2).sum()
+    return int(np.searchsorted(energy, threshold)) + 1
+
+
+def reconstruct_from_components(U: np.ndarray, S: np.ndarray, Vt: np.ndarray,
+                                  k: int) -> np.ndarray:
+    """Low-rank reconstruction using the top-k SVD components."""
+    return (U[:, :k] * S[:k]) @ Vt[:k, :]
+
+
+def cosine_similarity_matrix(A: np.ndarray) -> np.ndarray:
+    """Column-wise cosine similarity matrix."""
+    norms = np.linalg.norm(A, axis=0, keepdims=True) + 1e-12
+    An    = A / norms
+    return An.T @ An
