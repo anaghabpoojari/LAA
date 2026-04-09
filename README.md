@@ -68,7 +68,7 @@ pip install -r requirements.txt
 - **Dimensionality Estimate**: Optimal k for low-rank approximation
 - **Metagene Matrix**: Co-expressed gene modules
 - **Gene Rankings**: Scores for disease-discriminating genes
-- **Classification Accuracy**: Cross-validated performance
+- **Classification Accuracy**: Cross-validated performances
 - **Biomarker Panels**: Minimal gene sets for disease classification
 
 ## Validation Metrics
