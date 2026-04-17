@@ -4,7 +4,7 @@ const cards = [
   {
     icon: '🧮',
     title: 'The Data',
-    body: 'Expression matrix X ∈ ℝ^(m×n) — 15,000 genes × 300 cancer/healthy patients. Each entry X[i,j] = how active gene i is in patient j.',
+    body: 'Expression matrix X ∈ ℝ^(m×n) — 57,736 gene probes × 283 cancer/healthy patients. Each entry X[i,j] = how active gene i is in patient j.',
     color: 'blue',
   },
   {

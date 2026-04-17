@@ -2,6 +2,7 @@ import './index.css'
 import Navbar from './components/Navbar/Navbar'
 import Hero from './components/Hero/Hero'
 import Overview from './components/Overview/Overview'
+import Demo from './components/Demo/Demo'
 import MathSection from './components/MathSection/MathSection'
 import Pipeline from './components/Pipeline/Pipeline'
 import Modules from './components/Modules/Modules'
@@ -16,6 +17,7 @@ export default function App() {
       <main>
         <Hero />
         <Overview />
+        <Demo />
         <MathSection />
         <Pipeline />
         <Modules />

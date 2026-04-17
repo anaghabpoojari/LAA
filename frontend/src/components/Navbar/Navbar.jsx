@@ -3,6 +3,7 @@ import './Navbar.css'
 
 const links = [
   { href: '#overview', label: 'Overview' },
+  { href: '#demo', label: '⚡ Demo' },
   { href: '#math', label: 'Math' },
   { href: '#pipeline', label: 'Pipeline' },
   { href: '#modules', label: 'Modules' },

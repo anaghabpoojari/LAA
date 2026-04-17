@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import './Hero.css'
 
 const STATS = [
-  { target: 15000, label: 'Genes', suffix: '+' },
-  { target: 300, label: 'Patient Samples', suffix: '' },
+  { target: 57736, label: 'Genes (Probes)', suffix: '' },
+  { target: 283, label: 'Patient Samples', suffix: '' },
   { target: 7, label: 'Notebooks', suffix: '' },
   { target: 4, label: 'LA Techniques', suffix: '' },
 ]
@@ -107,7 +107,7 @@ export default function Hero() {
         </h1>
 
         <p className="hero-sub">
-          Decomposing a <strong>15,000 × 300</strong> patient matrix using{' '}
+          Decomposing a <strong>57,736 × 283</strong> patient matrix using{' '}
           <code>SVD</code>, <code>PCA</code>, <code>NMF</code> and{' '}
           <code>Eigenvalue Analysis</code> to reveal cancer-linked gene patterns
           invisible to the naked eye.
